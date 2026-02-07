@@ -108,10 +108,29 @@ func writeText(buf []byte) error {
 // if presents. The caller is responsible for opening/closing the
 // clipboard before calling this function.
 func readImage() ([]byte, error) {
+	// Prefer DIBV5 as it preserves alpha channel.
+	if b, err := readImageDIBV5(); err == nil {
+		return b, nil
+	}
+	// Fall back to CF_DIB.
+	if b, err := readImageDIB(); err == nil {
+		return b, nil
+	}
+	// Some apps (e.g. WeChat) may put PNG directly on the clipboard.
+	if b, err := readImagePNG(); err == nil {
+		return b, nil
+	}
+	// As a last resort, try CF_BITMAP.
+	if b, err := readImageBitmap(); err == nil {
+		return b, nil
+	}
+	return nil, errUnavailable
+}
+
+func readImageDIBV5() ([]byte, error) {
 	hMem, _, err := getClipboardData.Call(cFmtDIBV5)
 	if hMem == 0 {
-		// second chance to try FmtDIB
-		return readImageDib()
+		return nil, err
 	}
 	p, _, err := gLock.Call(hMem)
 	if p == 0 {
@@ -153,7 +172,7 @@ func readImage() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func readImageDib() ([]byte, error) {
+func readImageDIB() ([]byte, error) {
 	const (
 		fileHeaderLen = 14
 		infoHeaderLen = 40
@@ -161,8 +180,8 @@ func readImageDib() ([]byte, error) {
 	)
 
 	hClipDat, _, err := getClipboardData.Call(cFmtDIB)
-	if err != nil {
-		return nil, errors.New("not dib format data: " + err.Error())
+	if hClipDat == 0 {
+		return nil, err
 	}
 	pMemBlk, _, err := gLock.Call(hClipDat)
 	if pMemBlk == 0 {
@@ -181,8 +200,8 @@ func readImageDib() ([]byte, error) {
 	binary.Write(buf, binary.LittleEndian, uint16('B')|(uint16('M')<<8))
 	binary.Write(buf, binary.LittleEndian, uint32(dataSize))
 	binary.Write(buf, binary.LittleEndian, uint32(0))
-	const sizeof_colorbar = 0
-	binary.Write(buf, binary.LittleEndian, uint32(fileHeaderLen+infoHeaderLen+sizeof_colorbar))
+	const sizeofColorbar = 0
+	binary.Write(buf, binary.LittleEndian, uint32(fileHeaderLen+infoHeaderLen+sizeofColorbar))
 	j := 0
 	for i := fileHeaderLen; i < int(dataSize); i++ {
 		binary.Write(buf, binary.BigEndian, *(*byte)(unsafe.Pointer(pMemBlk + uintptr(j))))
@@ -191,13 +210,119 @@ func readImageDib() ([]byte, error) {
 	return bmpToPng(buf)
 }
 
+func readImagePNG() ([]byte, error) {
+	f := mustRegisterClipboardFormatA("PNG")
+	if f == 0 {
+		return nil, errUnsupported
+	}
+	hMem, _, err := getClipboardData.Call(f)
+	if hMem == 0 {
+		return nil, err
+	}
+	p, _, err := gLock.Call(hMem)
+	if p == 0 {
+		return nil, err
+	}
+	defer gUnlock.Call(hMem)
+	sz, _, err := globalSize.Call(hMem)
+	if sz == 0 {
+		return nil, err
+	}
+	data := unsafe.Slice((*byte)(unsafe.Pointer(p)), int(sz))
+	if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out, nil
+}
+
+func readImageBitmap() ([]byte, error) {
+	hBmp, _, err := getClipboardData.Call(cFmtBitmap)
+	if hBmp == 0 {
+		return nil, err
+	}
+
+	// Convert HBITMAP -> PNG using GDI.
+	var bm bitmap
+	r, _, err := getObjectW.Call(hBmp, uintptr(unsafe.Sizeof(bm)), uintptr(unsafe.Pointer(&bm)))
+	if r == 0 {
+		return nil, err
+	}
+
+	hdc, _, err := getDC.Call(0)
+	if hdc == 0 {
+		return nil, err
+	}
+	defer releaseDC.Call(0, hdc)
+
+	memDC, _, err := createCompatibleDC.Call(hdc)
+	if memDC == 0 {
+		return nil, err
+	}
+	defer deleteDC.Call(memDC)
+
+	old, _, err := selectObject.Call(memDC, hBmp)
+	if old == 0 {
+		return nil, err
+	}
+	defer selectObject.Call(memDC, old)
+
+	// Prepare a 32bpp top-down DIB section.
+	var bi bitmapInfo
+	bi.Header.Size = uint32(unsafe.Sizeof(bi.Header))
+	bi.Header.Width = int32(bm.Width)
+	bi.Header.Height = -int32(bm.Height)
+	bi.Header.Planes = 1
+	bi.Header.BitCount = 32
+	bi.Header.Compression = biRGB
+
+	var bits unsafe.Pointer
+	hDIB, _, err := createDIBSection.Call(memDC, uintptr(unsafe.Pointer(&bi)), dibRGBColors, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if hDIB == 0 {
+		return nil, err
+	}
+	defer deleteObject.Call(hDIB)
+
+	old2, _, err := selectObject.Call(memDC, hDIB)
+	if old2 == 0 {
+		return nil, err
+	}
+	defer selectObject.Call(memDC, old2)
+
+	r, _, err = bitBlt.Call(memDC, 0, 0, uintptr(bm.Width), uintptr(bm.Height), memDC, 0, 0, srccopy)
+	if r == 0 {
+		return nil, err
+	}
+
+	w := int(bm.Width)
+	h := int(bm.Height)
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	px := unsafe.Slice((*byte)(bits), w*h*4)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := (y*w + x) * 4
+			b := px[i+0]
+			g := px[i+1]
+			r := px[i+2]
+			a := px[i+3]
+			img.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: a})
+		}
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, img); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
 func bmpToPng(bmpBuf *bytes.Buffer) (buf []byte, err error) {
 	var f bytes.Buffer
-	original_image, err := bmp.Decode(bmpBuf)
+	originalImage, err := bmp.Decode(bmpBuf)
 	if err != nil {
 		return nil, err
 	}
-	err = png.Encode(&f, original_image)
+	err = png.Encode(&f, originalImage)
 	if err != nil {
 		return nil, err
 	}
@@ -301,38 +426,36 @@ func read(t Format) (buf []byte, err error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	var format uintptr
 	switch t {
 	case FmtImage:
-		format = cFmtDIBV5
+		// WeChat/Snipaste/QQ may not provide CF_DIBV5.
+		for {
+			r, _, _ := openClipboard.Call()
+			if r == 0 {
+				continue
+			}
+			break
+		}
+		defer closeClipboard.Call()
+		return readImage()
 	case FmtText:
 		fallthrough
 	default:
-		format = cFmtUnicodeText
-	}
-
-	// check if clipboard is avaliable for the requested format
-	r, _, err := isClipboardFormatAvailable.Call(format)
-	if r == 0 {
-		return nil, errUnavailable
-	}
-
-	// try again until open clipboard successed
-	for {
-		r, _, _ = openClipboard.Call()
+		// check if clipboard is avaliable for the requested format
+		r, _, _ := isClipboardFormatAvailable.Call(cFmtUnicodeText)
 		if r == 0 {
-			continue
+			return nil, errUnavailable
 		}
-		break
-	}
-	defer closeClipboard.Call()
 
-	switch format {
-	case cFmtDIBV5:
-		return readImage()
-	case cFmtUnicodeText:
-		fallthrough
-	default:
+		// try again until open clipboard successed
+		for {
+			r, _, _ = openClipboard.Call()
+			if r == 0 {
+				continue
+			}
+			break
+		}
+		defer closeClipboard.Call()
 		return readText()
 	}
 }
@@ -355,7 +478,6 @@ func write(t Format, buf []byte) (<-chan struct{}, error) {
 			break
 		}
 
-		// var param uintptr
 		switch t {
 		case FmtImage:
 			err := writeImage(buf)
@@ -367,7 +489,6 @@ func write(t Format, buf []byte) (<-chan struct{}, error) {
 		case FmtText:
 			fallthrough
 		default:
-			// param = cFmtUnicodeText
 			err := writeText(buf)
 			if err != nil {
 				errch <- err
@@ -402,8 +523,8 @@ func watch(ctx context.Context, t Format) <-chan []byte {
 	recv := make(chan []byte, 1)
 	ready := make(chan struct{})
 	go func() {
-		// not sure if we are too slow or the user too fast :)
 		ti := time.NewTicker(time.Second)
+		defer ti.Stop()
 		cnt, _, _ := getClipboardSequenceNumber.Call()
 		ready <- struct{}{}
 		for {
@@ -416,6 +537,7 @@ func watch(ctx context.Context, t Format) <-chan []byte {
 				if cnt != cur {
 					b := Read(t)
 					if b == nil {
+						cnt = cur
 						continue
 					}
 					recv <- b
@@ -485,6 +607,50 @@ type bitmapHeader struct {
 	ClrImportant  uint32
 }
 
+type bitmapInfoHeader struct {
+	Size          uint32
+	Width         int32
+	Height        int32
+	Planes        uint16
+	BitCount      uint16
+	Compression   uint32
+	SizeImage     uint32
+	XPelsPerMeter int32
+	YPelsPerMeter int32
+	ClrUsed       uint32
+	ClrImportant  uint32
+}
+
+type bitmapInfo struct {
+	Header bitmapInfoHeader
+	Colors [1]uint32
+}
+
+type bitmap struct {
+	Type       int32
+	Width      int32
+	Height     int32
+	WidthBytes int32
+	Planes     uint16
+	BitsPixel  uint16
+	Bits       unsafe.Pointer
+}
+
+const (
+	biRGB        = 0
+	dibRGBColors = 0
+	srccopy      = 0x00CC0020
+)
+
+func mustRegisterClipboardFormatA(name string) uintptr {
+	p, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return 0
+	}
+	r, _, _ := registerClipboardFormatA.Call(uintptr(unsafe.Pointer(p)))
+	return r
+}
+
 // Calling a Windows DLL, see:
 // https://github.com/golang/go/wiki/WindowsDLLs
 var (
@@ -520,7 +686,7 @@ var (
 	// calls to the EnumClipboardFormats function. For each call, the
 	// format parameter specifies an available clipboard format, and the
 	// function returns the next available clipboard format.
-	// https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isclipboardformatavailable
+	// https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumclipboardformats
 	enumClipboardFormats = user32.MustFindProc("EnumClipboardFormats")
 	// Retrieves the clipboard sequence number for the current window station.
 	// https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclipboardsequencenumber
@@ -546,6 +712,27 @@ var (
 	gAlloc = kernel32.NewProc("GlobalAlloc")
 	// Frees the specified global memory object and invalidates its handle.
 	// https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalfree
-	gFree   = kernel32.NewProc("GlobalFree")
-	memMove = kernel32.NewProc("RtlMoveMemory")
+	gFree = kernel32.NewProc("GlobalFree")
+	// Retrieves the size of the specified global memory object.
+	globalSize = kernel32.NewProc("GlobalSize")
+	memMove    = kernel32.NewProc("RtlMoveMemory")
+
+	gdi32 = syscall.MustLoadDLL("gdi32")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getobjectw
+	getObjectW = gdi32.MustFindProc("GetObjectW")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createdibsection
+	createDIBSection = gdi32.MustFindProc("CreateDIBSection")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createcompatibledc
+	createCompatibleDC = gdi32.MustFindProc("CreateCompatibleDC")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deletedc
+	deleteDC = gdi32.MustFindProc("DeleteDC")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-selectobject
+	selectObject = gdi32.MustFindProc("SelectObject")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-bitblt
+	bitBlt = gdi32.MustFindProc("BitBlt")
+	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
+	deleteObject = gdi32.MustFindProc("DeleteObject")
+
+	getDC     = user32.MustFindProc("GetDC")
+	releaseDC = user32.MustFindProc("ReleaseDC")
 )
